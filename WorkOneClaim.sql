@@ -1,6 +1,6 @@
 USE [JOINUP]
 GO
-/****** Object:  StoredProcedure [dbo].[up_repl_WorkOneClaim_Sedna]    Script Date: 05.02.2026 16:19:06 ******/
+/****** Object:  StoredProcedure [dbo].[up_repl_WorkOneClaim_Sedna]    Script Date: 05.02.2026 13:43:26 ******/
 SET ANSI_NULLS ON
 GO
 SET QUOTED_IDENTIFIER ON
@@ -40,6 +40,7 @@ GO
 -- Last update 07.01.2026 by D.Sharenko: SAMOSD-2345
 -- Last update 09.01.2026 by O.Filatova: include price calculation for Summers Tour for booking SAMOSD-2516
 -- Last update 02.02.2026 by O.Filatova: correct roomcode acording to market SAMOSD-2903
+-- Last update 05.02.2026 by D.Sharenko: SAMOSD-2856
 
 ALTER procedure [dbo].[up_repl_WorkOneClaim_Sedna]
  @remote varchar(10)='SMT',
@@ -52,10 +53,11 @@ as
   declare @data nvarchar(max),  @xml xml, @hdoc int, @url varchar(255), @login varchar(32), @password varchar(32), @Cookie_auth varchar(1024),  @http_status int, @reserve bit = 0, 
 	 @boards varchar(30), @market int, @d_flight varchar(16), @b_flight varchar(16), @hotel_net varchar(10), @market_alias varchar(6) , @transfer_net varchar(10)
   declare @inc table (inc int, far_inc int)
-  declare @people_status table (people int, status varchar(4))
+  declare @people_status table (people int, status varchar(4), born smalldateTime)
   declare @post_data nvarchar(max),  @order int, @operator int , @adult tinyint, @cost money = 0,
      @child tinyint ,  @customers varchar(max) ='[', @max_child_age tinyint, @htplace int, @hotel_remark varchar(128),   @transfertypeArr tinyint, @transfertypeDep tinyint, 
-	 @claim_remark varchar(128) ='',  @updated bit = 0, @cancelled bit =0, @id int, @histMasterInc int, @ClaimHistMsg varchar(255)
+	 @claim_remark varchar(128) ='',  @updated bit = 0, @cancelled bit =0, @id int, @histMasterInc int, @ClaimHistMsg varchar(255), @pcount tinyint, @infantextracting bit
+
   
   declare @errmes nvarchar(max),
           @message_from_response nvarchar(max) 
@@ -254,23 +256,34 @@ as
 	 SELECT @hotel_remark = replace(@hotel_remark,'"',' ') 	 --itjoin 12.06.2024	
 	 SELECT @hotel_remark = replace(@hotel_remark,'''',' ')  --itjoin 12.06.2024	
 
-	select @max_child_age = ceiling(max(age)) from
+	 select @pcount = pcount from htplace where inc = @htplace -- itjoin SAMOSD-2856
+
+	 select @max_child_age = ceiling(max(age)) from
 		(select isnull(age1max ,0) as  age from htplace where inc = @htplace
 		union select isnull(age2max ,0) as age from htplace where inc = @htplace
 		union select isnull(age3max ,0) as age from htplace where inc = @htplace
 		) t
 
-	 insert into @people_status(people, status)
+	 insert into @people_status(people, status, born)
 	 select  p.inc,  case p.human 
 	 when 'MR' then 'Mr'
 	 when 'MRS' then 'Mrs'
 	 when 'CHD' then  case when dbo.sto_AgeofPeople (o.datebeg, p.born) >=@max_child_age then
 	 case when p.male = 1 then 'Mr' else 'Mrs' end else 'Chd' end
 	 when 'INF' then 'Inf'
-	 end
+	 end,
+	 p.born
 	 from people p
 	 join opeople op on op.people = p.inc and op.[order] = @order
 	 join [order] o on o.inc = op.[order]
+
+	 if @@rowcount <> isnull(@pcount, 0)  -- itjoin SAMOSD-2856
+	 begin
+	   set @infantextracting = 1
+	   
+       delete ps from @people_status ps   -- удаляем из people_status туриста с минимальным возрастом
+	   where ps.inc = (select top 1 inc from @people_status order by born)
+	 end
 
 	 if @market is null
 	  begin
@@ -576,22 +589,26 @@ if @develop =1 select @post_data as order_data
 		--endjoin
 
 	   end
-	   else 
+	   -- else
+	   if isnull(@id, 0) = 0 or isnull(@infantextracting, 0) = 1   -- SAMOSD-2856
 	   begin
 
 	    -- itjoin SAMOSD-2280
 		declare @json_error nvarchar(max)
-		set @json_error  = replace(@data,'{reservation:','{"reservation":') 
+		if isnull(@id, 0) = 0     -- SAMOSD-2856
+		begin
+		  set @json_error  = replace(@data,'{reservation:','{"reservation":') 
 
-		if ISJSON(@json_error) = 1 --30.12.2025 by D.Zhura: HotFIX SAMOSD-2345
-		select @message_from_response = json_value(@json_error, '$.reservation.Message');
-	
-		if isnull(@message_from_response,'') <> ''
+          if ISJSON(@json_error) = 1 --30.12.2025 by D.Zhura: HotFIX SAMOSD-2345
+		  select @message_from_response = json_value(@json_error, '$.reservation.Message');
+	      
+		  if isnull(@message_from_response,'') <> ''
 			begin
 				select @message_from_response =  'Error sending reservation via integration: ' + @message_from_response
 				insert into claim_history(transactionid,histtable,recordinc,mode,description,[user],edate,claim,regmod_user_alias)
 				select newid(),1,@claim,'E',@message_from_response,1,getdate(),@claim,null
 			end
+        end
 		-- endjoin
 
 	    set @errmes  = 'Sending reservation via email. Successfully sent'
